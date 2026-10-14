@@ -5,6 +5,7 @@
 
 // ============================================================
 // PIN ASSIGNMENTS
+// One ILD213T board per half-bridge (2 channels = HIN + LIN)
 // ============================================================
 
 #define PWM_A_HIN 25
@@ -17,43 +18,55 @@
 #define PWM_C_LIN 33
 
 // ============================================================
-// PWM SETTINGS
+// OPTO POLARITY
+// 0 = ESP pin HIGH -> LED on -> your circuit's output goes HIGH
+//     (e.g. phototransistor used as emitter-follower, or a driver
+//      that inverts it back)
+// 1 = ESP pin is inverted in hardware by MCPWM. Use this if your
+//     output stage (common-emitter + pull-up) inverts the signal
+//     and you want the signal AFTER the opto to be the normal
+//     HIN/LIN logic.
+// Check with a scope on the opto OUTPUT, not the ESP pin.
 // ============================================================
 
-#define CARRIER_FREQ       16000UL      // 16 kHz
-#define TIMER_RESOLUTION   10000000UL   // 10 MHz -> 0.1 us per tick
-#define PWM_PERIOD         (TIMER_RESOLUTION / CARRIER_FREQ)   // 625 ticks
+#define OPTO_INVERT_OUTPUT 0
 
-#define DEAD_TIME_US       1
-#define DEAD_TIME_TICKS    ((TIMER_RESOLUTION / 1000000UL) * DEAD_TIME_US)  // 10 ticks
+// ============================================================
+// PWM SETTINGS
+// ILD213T is a phototransistor opto: ~3-10+ us switching delay,
+// so carrier is lowered and dead time is increased.
+// ============================================================
+
+#define CARRIER_FREQ       5000UL       // 5 kHz (try 4-8 kHz)
+#define TIMER_RESOLUTION   10000000UL   // 10 MHz -> 0.1 us per tick
+#define PWM_PERIOD         (TIMER_RESOLUTION / CARRIER_FREQ)   // 2000 ticks
+
+#define DEAD_TIME_US       5            // must exceed opto turn-off time mismatch
+#define DEAD_TIME_TICKS    ((TIMER_RESOLUTION / 1000000UL) * DEAD_TIME_US)  // 50 ticks
 
 // ============================================================
 // OUTPUT SETTINGS
 // ============================================================
 
-#define SINE_FREQ_HZ       5.0       // electrical output frequency
-#define AMPLITUDE          0.43      // 0.0 - 0.5 (fraction of the period, around 50% center)
+#define SINE_FREQ_HZ       5.0
+#define AMPLITUDE          0.40      // 0.0 - 0.5
 
-// Keep AMPLITUDE <= ~0.45 so minimum on-time stays longer than dead time
-// (0.05 * 625 = 31 ticks > 10 dead-time ticks)
+// Minimum pulse (on or off) must comfortably exceed dead time + opto delay
+static_assert((0.5 - AMPLITUDE) * PWM_PERIOD > 3 * DEAD_TIME_TICKS,
+              "AMPLITUDE too high for this dead time: reduce AMPLITUDE or DEAD_TIME_US");
 
 // ============================================================
-// SINE LOOKUP (compare values in timer ticks)
+// SINE LOOKUP
 // ============================================================
 
 #define TABLE_SIZE 256
 static uint16_t compareTable[TABLE_SIZE];
 
-// ============================================================
-// PHASE ACCUMULATOR
-// 32-bit: top 8 bits select the table entry
-// ============================================================
-
 static volatile uint32_t phaseAcc = 0;
 static uint32_t phaseInc = 0;
 
-#define PHASE_120 0x55555555UL   // 2^32 / 3
-#define PHASE_240 0xAAAAAAAAUL   // 2 * 2^32 / 3
+#define PHASE_120 0x55555555UL
+#define PHASE_240 0xAAAAAAAAUL
 
 // ============================================================
 // MCPWM HANDLES
@@ -92,18 +105,12 @@ void buildSineTable() {
     }
 }
 
-// ============================================================
-// SET OUTPUT FREQUENCY
-// ============================================================
-
 void setFrequency(double hz) {
-    // phase step per PWM period
     phaseInc = (uint32_t)(hz * 4294967296.0 / (double)CARRIER_FREQ);
 }
 
 // ============================================================
-// TIMER ISR: runs once per PWM period (at timer peak)
-// Comparator values latch at the next TEZ, so no mid-cycle glitch.
+// TIMER ISR: once per PWM period
 // ============================================================
 
 static bool IRAM_ATTR onTimerFull(
@@ -122,7 +129,7 @@ static bool IRAM_ATTR onTimerFull(
     mcpwm_comparator_set_compare_value(cmprB, compareTable[idxB]);
     mcpwm_comparator_set_compare_value(cmprC, compareTable[idxC]);
 
-    return false;   // no task wake-up needed
+    return false;
 }
 
 // ============================================================
@@ -137,17 +144,16 @@ void configurePhase(
     mcpwm_gen_handle_t *genHigh,
     mcpwm_gen_handle_t *genLow
 ) {
-    // Generators
     mcpwm_generator_config_t genHighConfig = {};
     genHighConfig.gen_gpio_num = highPin;
+    genHighConfig.flags.invert_pwm = OPTO_INVERT_OUTPUT;
     ESP_ERROR_CHECK(mcpwm_new_generator(oper, &genHighConfig, genHigh));
 
     mcpwm_generator_config_t genLowConfig = {};
     genLowConfig.gen_gpio_num = lowPin;
+    genLowConfig.flags.invert_pwm = OPTO_INVERT_OUTPUT;
     ESP_ERROR_CHECK(mcpwm_new_generator(oper, &genLowConfig, genLow));
 
-    // PWM waveform on the HIGH-side generator only:
-    // timer empty -> HIGH, compare match -> LOW
     ESP_ERROR_CHECK(mcpwm_generator_set_action_on_timer_event(
         *genHigh,
         MCPWM_GEN_TIMER_EVENT_ACTION(
@@ -162,14 +168,13 @@ void configurePhase(
             cmpr,
             MCPWM_GEN_ACTION_LOW)));
 
-    // Dead time
     // High side: delay rising edge
     mcpwm_dead_time_config_t dtHigh = {};
     dtHigh.posedge_delay_ticks = DEAD_TIME_TICKS;
     dtHigh.negedge_delay_ticks = 0;
     ESP_ERROR_CHECK(mcpwm_generator_set_dead_time(*genHigh, *genHigh, &dtHigh));
 
-    // Low side: takes the high-side signal, inverts it, delays its rising edge
+    // Low side: inverted high-side signal, rising edge delayed
     mcpwm_dead_time_config_t dtLow = {};
     dtLow.posedge_delay_ticks = 0;
     dtLow.negedge_delay_ticks = DEAD_TIME_TICKS;
@@ -186,16 +191,16 @@ void setup() {
     delay(500);
 
     Serial.println();
-    Serial.println("3-Phase MCPWM Starting...");
+    Serial.println("3-Phase MCPWM (opto-isolated) Starting...");
     Serial.printf("Carrier: %lu Hz\n", CARRIER_FREQ);
     Serial.printf("Period ticks: %lu\n", PWM_PERIOD);
     Serial.printf("Dead time: %d us (%lu ticks)\n", DEAD_TIME_US, DEAD_TIME_TICKS);
     Serial.printf("Output frequency: %.2f Hz\n", SINE_FREQ_HZ);
+    Serial.printf("Invert output: %d\n", OPTO_INVERT_OUTPUT);
 
     buildSineTable();
     setFrequency(SINE_FREQ_HZ);
 
-    // Timer
     mcpwm_timer_config_t timerConfig = {};
     timerConfig.group_id      = 0;
     timerConfig.clk_src       = MCPWM_TIMER_CLK_SRC_DEFAULT;
@@ -204,7 +209,6 @@ void setup() {
     timerConfig.period_ticks  = PWM_PERIOD;
     ESP_ERROR_CHECK(mcpwm_new_timer(&timerConfig, &timer));
 
-    // Operators
     mcpwm_operator_config_t operatorConfig = {};
     operatorConfig.group_id = 0;
     ESP_ERROR_CHECK(mcpwm_new_operator(&operatorConfig, &operA));
@@ -215,40 +219,29 @@ void setup() {
     ESP_ERROR_CHECK(mcpwm_operator_connect_timer(operB, timer));
     ESP_ERROR_CHECK(mcpwm_operator_connect_timer(operC, timer));
 
-    // Comparators (value latched at timer-empty)
     mcpwm_comparator_config_t cmpConfig = {};
     cmpConfig.flags.update_cmp_on_tez = true;
     ESP_ERROR_CHECK(mcpwm_new_comparator(operA, &cmpConfig, &cmprA));
     ESP_ERROR_CHECK(mcpwm_new_comparator(operB, &cmpConfig, &cmprB));
     ESP_ERROR_CHECK(mcpwm_new_comparator(operC, &cmpConfig, &cmprC));
 
-    // Half-bridges
     configurePhase(operA, cmprA, PWM_A_HIN, PWM_A_LIN, &genAH, &genAL);
     configurePhase(operB, cmprB, PWM_B_HIN, PWM_B_LIN, &genBH, &genBL);
     configurePhase(operC, cmprC, PWM_C_HIN, PWM_C_LIN, &genCH, &genCL);
 
-    // Initial duty (50% on all phases until the ISR takes over)
     ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(cmprA, compareTable[0]));
     ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(cmprB, compareTable[85]));
     ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(cmprC, compareTable[171]));
 
-    // Register the per-period ISR (must be done before enabling the timer)
     mcpwm_timer_event_callbacks_t cbs = {};
     cbs.on_full = onTimerFull;
     ESP_ERROR_CHECK(mcpwm_timer_register_event_callbacks(timer, &cbs, NULL));
 
-    // Start
     ESP_ERROR_CHECK(mcpwm_timer_enable(timer));
     ESP_ERROR_CHECK(mcpwm_timer_start_stop(timer, MCPWM_TIMER_START_NO_STOP));
 
     Serial.println("MCPWM running.");
 }
-
-// ============================================================
-// LOOP
-// Nothing to do: the ISR handles all waveform updates.
-// Call setFrequency(x) here if you want to change frequency at runtime.
-// ============================================================
 
 void loop() {
     delay(1000);
